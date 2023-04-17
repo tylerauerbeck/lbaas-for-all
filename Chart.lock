@@ -1,0 +1,15 @@
+dependencies:
+- name: load-balancer-operator
+  repository: https://infratographer.github.io/charts
+  version: v0.0.2
+- name: load-balancer-api
+  repository: https://infratographer.github.io/charts
+  version: v0.0.13
+- name: nats
+  repository: https://nats-io.github.io/k8s/helm/charts/
+  version: 0.19.12
+- name: cockroachdb
+  repository: https://charts.cockroachdb.com/
+  version: 10.0.7
+digest: sha256:856dcb416632fd724861f7f2b43f0cae2db809da20b7ff09c8c6cbedd0e81989
+generated: "2023-04-15T13:26:33.742372-04:00"

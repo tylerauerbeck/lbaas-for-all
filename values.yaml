@@ -1,0 +1,255 @@
+infratographer:
+  lbaas:
+    api:
+      enabled: true 
+    operator:
+      enabled: true
+
+# enable single user for auth mode
+nats:
+  fullnameOverride: nats
+  #namespaceOverride: nats
+  nameOverride: nats
+  nats:
+    jetstream:
+      enabled: true
+      memStorage:
+        enabled: true
+        size: 1Gi
+      fileStorage:
+        enabled: true
+        size: 10Gi
+
+cockroachdb:
+  nameOverride: cockroachdb
+  fullnameOverride: cockroachdb
+  
+  namespaceOverride: cockroachdb
+  single-node: true
+  statefulset:
+    replicas: 1
+
+  init:
+    provisioning:
+      enabled: true
+      users:
+        - name: loadbalancerapi
+          password: thisisadummypassword
+          options: [LOGIN]
+      databases:
+        - name: load_balancer_api_dev 
+          owners: [loadbalancerapi]
+
+#TODO: add namespaceoverride for api
+#TODO: add nameoverride for api
+#TODO: fix extraenvvars for api
+#TODO: Need secrets
+load-balancer-api:
+  extraEnvVars:
+    LOADBALANCERAPI_DEBUG: "true"
+    LOADBALANCERAPI_CRDB_URI: "postgresql://root@cockroachdb:26257/load_balancer_api_dev?sslmode=disable"
+  ingress:
+    enabled: false
+  tls:
+    enabled: false
+  api:
+    db:
+      certSecret: cockroachdb-ca-secret 
+    events:
+      auth:
+        secretName: ""
+      connectionURL: "nats://nats:4222"
+      queue: "lbaas"
+      subjects: "com.infratographer.events"
+    migrateOnInit: true
+
+#TODO: add nameoverride for operator
+#TODO: add namespaceoverride for operator
+#TODO: fix extraEnvVars for operator
+#TODO: enable development mode for manager
+load-balancer-operator:
+  serviceAccount:
+    create: true
+    name: "load-balancer-operator"
+  operator:
+    extraEnvVars:
+      LOADBALANCEROPERATOR_DEVELOPMENT: "true"
+    resources:
+      limits:
+        cpu: 2
+        memory: 2Gi
+    chart:
+      configMapName: "lbaas-for-all-lb-chart"
+      valuesMemoryFlag: []
+      valuesCPUFlag: []
+    events:
+      connectionURL: "nats:4222"
+      subjects: "com.infratographer.events.load-balancer"
+      queue: "lbaas"
+      auth:
+        secretName: ""
+
+chartValues:
+  replicaCount: 1 
+  resources:
+    limits:
+      cpu: 2
+      memory: 4Gi
+    requests:
+      cpu: 2
+      memory: 4Gi
+  args:
+    - -f
+    - /app/haproxy.cfg
+  extraDeploy:
+    - apiVersion: v1
+      kind: Secret
+      metadata:
+        name: dataplane-api-creds
+        namespace: "{{ .Release.Namespace }}"
+      type: Opaque
+      data:
+        dataplane_creds: "{{ randAlphaNum 32 | b64enc }}"
+    - apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: manager-dataplane-config
+        namespace: "{{ .Release.Namespace }}"
+      data:
+        dataplaneapi.cfg: |
+          config_version = 2
+          name = "c4aa86c4fe66"
+          mode = "single"
+          dataplaneapi {
+            host = "127.0.0.1"
+            port = 5555
+            user "haproxy" {
+              insecure = true
+              password = {{ printf "\"{{ .dataplane_creds }}\"" }}
+            }
+            transaction {
+              transaction_dir = "/tmp/haproxy"
+            }
+            advertised {}
+          }
+          haproxy {
+            config_file = "/app/haproxy.cfg"
+            haproxy_bin = "/opt/bitnami/haproxy/sbin/haproxy"
+            reload {
+              reload_delay = 5
+              reload_cmd   = "kill SIGUSR 1"
+              restart_cmd  = "service haproxy restart"
+              reload_strategy = "custom"
+            }
+          }
+    - apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: manager-haproxy-config
+        namespace: "{{ .Release.Namespace }}"
+      data:
+        haproxy.cfg: |
+          global
+            master-worker
+            maxconn 200
+            pidfile /app/haproxy.pid
+            stats socket /app/haproxy.sock mode 660 level admin expose-fd listeners
+          log 127.0.0.1 local0
+          defaults
+            mode tcp
+            log global
+            option tcplog
+            timeout connect 5s
+            timeout client 50s
+            timeout server 50s
+            retries 3
+          program dataplaneapi
+            command dataplaneapi -f /app/dataplaneapi.cfg
+            no option start-on-reload
+  extraVolumes:
+    - name: manager-haproxy-conf
+      configMap:
+        name: manager-haproxy-config
+    - name: manager-dataplane-conf
+      configMap:
+        name: manager-dataplane-config
+    - name: configs
+      emptydir: {}
+    - name: etc-haproxy
+      emptydir: {}
+  extraVolumeMounts:
+    - name: configs
+      mountPath: /app
+    - name: etc-haproxy
+      mountPath: /etc/haproxy/
+  initContainers:
+    - name: dataplaneapi-templater
+      image: ghcr.io/tylerauerbeck/gotpl-util:latest
+      imagePullPolicy: Always
+      command:
+        [
+          "sh",
+          "-c",
+          'echo "dataplane_creds: ${DATAPLANE_PASS}" | gotpl /dataplaneapi.cfg > /app/dataplaneapi.cfg',
+        ]
+      env:
+        - name: DATAPLANE_PASS
+          valueFrom:
+            secretKeyRef:
+              name: dataplane-api-creds
+              key: dataplane_creds
+      volumeMounts:
+        - mountPath: /app
+          name: configs
+        - mountPath: /dataplaneapi.cfg
+          name: manager-dataplane-conf
+          subPath: dataplaneapi.cfg
+    - name: haproxy-config-copier
+      image: ghcr.io/tylerauerbeck/gotpl-util:latest
+      imagePullPolicy: Always
+      command:
+        [
+          "sh",
+          "-c",
+          "cp /haproxy.cfg /app/haproxy.cfg && chown -R 1001:1001 /app /etc/haproxy",
+        ]
+      volumeMounts:
+        - mountPath: /app
+          name: configs
+        - mountPath: /haproxy.cfg
+          name: manager-haproxy-conf
+          subPath: haproxy.cfg
+        - mountPath: /etc/haproxy
+          name: etc-haproxy
+  sidecars:
+    - name: loadbalancer-haproxy-manager
+      image: ghcr.io/infratographer/loadbalancer-manager-haproxy:latest
+      imagePullPolicy: Always
+      env:
+        - name: LOADBALANCER_MANAGER_HAPROXY_DATAPLANE_USER_PWD
+          valueFrom:
+            secretKeyRef:
+              name: dataplane-api-creds
+              key: dataplane_creds
+      command:
+        - /loadbalancer-manager-haproxy
+      args:
+        - run
+        - --nats-creds=/creds
+        - --base-haproxy-config=/haproxy.cfg
+        - --nats-url=nats://nats:4222
+        - --nats-subject=com.infratographer.events.frontends.>
+        - --loadbalancerapi-url=http://lbaas-for-all-load-balancer-api
+      resources:
+        limits:
+          cpu: 2
+          memory: 1Gi
+        requests:
+          cpu: 2
+          memory: 1Gi
+      volumeMounts:
+        - mountPath: /app
+          name: configs
+        - mountPath: /haproxy.cfg
+          name: manager-haproxy-conf
+          subPath: haproxy.cfg
